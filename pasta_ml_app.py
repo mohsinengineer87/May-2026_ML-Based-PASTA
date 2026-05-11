@@ -18,6 +18,7 @@ Deps: pip install streamlit plotly pandas numpy scikit-learn networkx shap
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
 import io, json, time, tracemalloc, warnings
+from datetime import datetime, timedelta
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -29,9 +30,17 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import shap
 
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import (
+    RandomForestRegressor, GradientBoostingRegressor,
+    RandomForestClassifier, GradientBoostingClassifier,
+)
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import (
+    r2_score, mean_absolute_error, mean_squared_error,
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, average_precision_score, confusion_matrix,
+    roc_curve, precision_recall_curve,
+)
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.inspection import permutation_importance
 
@@ -117,6 +126,45 @@ ATTACK_VECTORS = {
     "Zero-Day Exploit":      {"difficulty": 0.90, "tactic": "Exploitation",     "cvss_base": 9.9},
 }
 
+# ── LAYERED TOPOLOGY MAPPING (NEW) ────────────────────────────────────────────
+# Maps each asset type to one of three architectural layers (Core / Distribution / Access)
+# Core         → backbone, critical (Barabási–Albert scale-free graph)
+# Distribution → mid-tier services    (Watts–Strogatz small-world graph)
+# Access       → edge / leaf          (random tree)
+ASSET_LAYER_MAPPING = {
+    "Database Server": "Core",
+    "SCADA/ICS":       "Core",
+    "Cloud VM":        "Distribution",
+    "Enterprise App":  "Distribution",
+    "Network Device":  "Distribution",
+    "IoT Device":      "Access",
+    "Endpoint":        "Access",
+}
+LAYER_ZONES  = {"Core": "secure",   "Distribution": "internal", "Access": "dmz"}
+LAYER_COLORS = {"Core": "#27ae60",  "Distribution": "#2980b9",  "Access": "#c0392b"}
+LAYER_ORDINAL = {"Access": 0, "Distribution": 1, "Core": 2}
+
+# Centrality-derived features added to the asset/event records.
+CENTRALITY_FEATS = [
+    "degree_centrality",
+    "betweenness_centrality",
+    "eigenvector_centrality",
+    "clustering_coefficient",
+]
+
+# Feature set used by the binary attack-vs-normal alerting classifier (Step 5b).
+# IMPORTANT: this is INTENTIONALLY disjoint from the formula used to derive the
+# regression target risk_score, so the classifier head is not learning the same
+# signal as the regression head. The label is derived from whether the asset was
+# actually traversed in a Monte-Carlo attack simulation, not from any risk formula.
+CLASSIFIER_FEATS = [
+    "criticality", "exposure", "patch_compliance", "control_coverage",
+    "vuln_count",  "asset_criticality_score",
+    "degree_centrality", "betweenness_centrality",
+    "eigenvector_centrality", "clustering_coefficient",
+    "layer_ord",
+]
+
 PASTA_STAGES = {
     1: {"name":"Define Objectives",        "icon":"🎯", "color":"#1a5276"},
     2: {"name":"Technical Scope",          "icon":"🗺️", "color":"#1f618d"},
@@ -157,12 +205,18 @@ FEATURE_DESCRIPTIONS = {
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 _defaults = {
-    "env":            None,   # simulated environment (Step 2)
-    "scenarios":      None,   # threat scenarios DataFrame (Step 3)
-    "features":       None,   # engineered feature DataFrame (Step 4)
-    "ml_results":     None,   # trained models + metrics (Step 5)
-    "bench_results":  None,   # scalability benchmark DataFrame (Step 6)
-    "attack_graph":   None,   # NetworkX DiGraph (Step 3)
+    "env":              None,   # simulated environment (Step 2)
+    "scenarios":        None,   # threat scenarios DataFrame (Step 3)
+    "features":         None,   # engineered feature DataFrame (Step 4)
+    "ml_results":       None,   # trained regression models + metrics (Step 5)
+    "bench_results":    None,   # scalability benchmark DataFrame (Step 6)
+    "attack_graph":     None,   # legacy attack-graph stats (Step 3)
+    # ── NEW: layered topology + Monte-Carlo alerting (Step 5b) ────────────────
+    "topology":         None,   # node-link JSON of the layered enterprise graph
+    "mc_events":        None,   # event-level dataset (attack + normal)
+    "mc_paths":         None,   # list of attack paths from Monte-Carlo runs
+    "mc_stats":         None,   # path-length / compromise statistics
+    "clf_results":      None,   # trained alerting classifier results
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -188,6 +242,124 @@ def complexity_class(slope):
     if slope < 1.5:   return "🟡 O(N^k) — Near-Linear", "#f39c12"
     if slope < 2.0:   return "🟠 O(N^k) — Super-Linear","#e67e22"
     return              "🔴 O(N²+) — Quadratic+",        "#c0392b"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# LAYERED TOPOLOGY + CENTRALITY ENGINE  (NEW — Home.py ideas #1 + #2)
+# ═══════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+def _random_tree(n, seed):
+    """Version-agnostic random tree (avoids networkx API drift across versions)."""
+    rng = np.random.default_rng(seed)
+    G = nx.Graph()
+    if n <= 0:
+        return G
+    G.add_node(0)
+    for i in range(1, n):
+        parent = int(rng.integers(0, i))
+        G.add_edge(parent, i)
+    return G
+
+
+@st.cache_data(show_spinner=False)
+def build_layered_topology(ids_by_layer_json, seed):
+    """
+    Build the enterprise graph as three composed sub-graphs, one per layer:
+      • Core         → Barabási–Albert (scale-free, hub-and-spoke)
+      • Distribution → Watts–Strogatz   (small-world)
+      • Access       → Random tree      (edge / leaf)
+    Then deterministically inter-link layers (Access → Distribution → Core).
+
+    Returns: node-link JSON of an nx.DiGraph where every node carries
+    `asset_id`, `layer`, `zone` attributes. Edge direction encodes attack flow
+    (inward, from Access toward Core).
+    """
+    layers = json.loads(ids_by_layer_json)
+    core_ids   = layers.get("Core", [])
+    dist_ids   = layers.get("Distribution", [])
+    access_ids = layers.get("Access", [])
+
+    # ── per-layer graphs ──────────────────────────────────────────────────────
+    # Core: scale-free hubs
+    if len(core_ids) >= 3:
+        Gc_int = nx.barabasi_albert_graph(len(core_ids),
+                                          min(2, len(core_ids) - 1),
+                                          seed=int(seed))
+    else:
+        Gc_int = nx.path_graph(max(1, len(core_ids)))
+    Gc = nx.relabel_nodes(Gc_int, dict(enumerate(core_ids)))
+
+    # Distribution: small-world
+    k_ws = min(4, max(2, len(dist_ids) - 1))
+    if len(dist_ids) >= 4:
+        Gd_int = nx.watts_strogatz_graph(len(dist_ids), k_ws, 0.2,
+                                         seed=int(seed))
+    else:
+        Gd_int = nx.path_graph(max(1, len(dist_ids)))
+    Gd = nx.relabel_nodes(Gd_int, dict(enumerate(dist_ids)))
+
+    # Access: random tree
+    Ga_int = _random_tree(len(access_ids), seed=int(seed))
+    Ga = nx.relabel_nodes(Ga_int, dict(enumerate(access_ids)))
+
+    G_und = nx.compose_all([Gc, Gd, Ga]) if (core_ids or dist_ids or access_ids) else nx.Graph()
+
+    # Annotate layer / zone
+    for n in core_ids:   G_und.add_node(n); G_und.nodes[n]["layer"] = "Core";         G_und.nodes[n]["zone"] = LAYER_ZONES["Core"]
+    for n in dist_ids:   G_und.add_node(n); G_und.nodes[n]["layer"] = "Distribution"; G_und.nodes[n]["zone"] = LAYER_ZONES["Distribution"]
+    for n in access_ids: G_und.add_node(n); G_und.nodes[n]["layer"] = "Access";       G_und.nodes[n]["zone"] = LAYER_ZONES["Access"]
+
+    # Inter-layer wiring: Distribution → Core, Access → Distribution
+    for i, n in enumerate(dist_ids):
+        if core_ids:   G_und.add_edge(n, core_ids[i % len(core_ids)])
+    for i, n in enumerate(access_ids):
+        if dist_ids:   G_und.add_edge(n, dist_ids[i % len(dist_ids)])
+
+    # Directed: attack-flow direction is inward (lower layer → higher layer)
+    G = nx.DiGraph()
+    for n, data in G_und.nodes(data=True):
+        G.add_node(n, **data)
+    for u, v in G_und.edges():
+        lu = G_und.nodes[u].get("layer", "Distribution")
+        lv = G_und.nodes[v].get("layer", "Distribution")
+        ru, rv = LAYER_ORDINAL.get(lu, 1), LAYER_ORDINAL.get(lv, 1)
+        if ru < rv:        G.add_edge(u, v)            # outer → inner
+        elif ru > rv:      G.add_edge(v, u)
+        else:              G.add_edge(u, v); G.add_edge(v, u)  # peer (intra-layer)
+    return json.dumps(nx.node_link_data(G))
+
+
+@st.cache_data(show_spinner=False)
+def compute_centrality_features(topology_json):
+    """
+    Derive graph-structural features per node from the layered topology.
+    These complement (do not replace) the existing asset-intrinsic features.
+    Uses eigenvector_centrality_numpy with a PageRank fallback for robustness.
+    """
+    G = nx.node_link_graph(json.loads(topology_json))
+    G_und = G.to_undirected()
+
+    dc = nx.degree_centrality(G)
+    bc = nx.betweenness_centrality(G, normalized=True)
+    try:
+        ec = nx.eigenvector_centrality_numpy(G)
+    except Exception:
+        ec = nx.pagerank(G)
+    cc = nx.clustering(G_und)
+
+    rows = []
+    for n in G.nodes:
+        rows.append({
+            "asset_id":               n,
+            "degree_centrality":      round(float(dc.get(n, 0.0)), 6),
+            "betweenness_centrality": round(float(bc.get(n, 0.0)), 6),
+            "eigenvector_centrality": round(float(ec.get(n, 0.0)), 6),
+            "clustering_coefficient": round(float(cc.get(n, 0.0)), 6),
+            "layer":                  G.nodes[n].get("layer", "Distribution"),
+            "zone":                   G.nodes[n].get("zone",  "internal"),
+        })
+    return pd.DataFrame(rows)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
@@ -229,6 +401,26 @@ def simulate_environment(n_assets, seed, asset_mix, threat_actor_types):
 
     asset_df = pd.DataFrame(assets)
 
+    # ── NEW: layer / zone assignment + centrality features ──────────────────
+    # Each asset is mapped to one of three architectural layers (Core / Dist / Access)
+    # based on its type, then the BA + WS + Tree composite topology is built and
+    # graph-structural centrality features are merged into the asset record.
+    asset_df["layer"] = asset_df["asset_type"].map(ASSET_LAYER_MAPPING).fillna("Distribution")
+    asset_df["zone"]  = asset_df["layer"].map(LAYER_ZONES).fillna("internal")
+    asset_df["layer_ord"] = asset_df["layer"].map(LAYER_ORDINAL).fillna(1).astype(int)
+
+    ids_by_layer = {
+        layer: asset_df.loc[asset_df["layer"] == layer, "asset_id"].tolist()
+        for layer in ["Core", "Distribution", "Access"]
+    }
+    topology_json = build_layered_topology(json.dumps(ids_by_layer), int(seed))
+    cent_df = compute_centrality_features(topology_json)
+    asset_df = asset_df.merge(
+        cent_df[["asset_id"] + CENTRALITY_FEATS], on="asset_id", how="left"
+    )
+    for f in CENTRALITY_FEATS:
+        asset_df[f] = asset_df[f].fillna(0.0)
+
     # Threat actors
     threat_actors = []
     for ta_type in threat_actor_types:
@@ -245,7 +437,8 @@ def simulate_environment(n_assets, seed, asset_mix, threat_actor_types):
     actor_df = pd.DataFrame(threat_actors)
 
     return {"assets": asset_df, "actors": actor_df, "seed": seed,
-            "n_assets": len(asset_df), "n_actors": len(actor_df)}
+            "n_assets": len(asset_df), "n_actors": len(actor_df),
+            "topology_json": topology_json}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
@@ -253,36 +446,40 @@ def simulate_environment(n_assets, seed, asset_mix, threat_actor_types):
 # ═══════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def generate_scenarios(env_assets_json, env_actors_json, n_scenarios,
-                       selected_vectors, seed, max_path_len):
-    """Generate synthetic threat scenarios and build the attack graph."""
+def generate_scenarios(env_assets_json, env_actors_json, topology_json,
+                       n_scenarios, selected_vectors, seed, max_path_len):
+    """Generate synthetic threat scenarios on the layered enterprise topology.
+
+    Uses the BA + WS + Tree composite graph built in Step 2 as the attack graph
+    (replacing the prior random Poisson-edge graph). Each edge is annotated
+    with an attack vector + CVSS-derived weight for Dijkstra shortest-path
+    computation.
+    """
     rng  = np.random.default_rng(seed)
     asset_df = pd.read_json(io.StringIO(env_assets_json), orient="records")
     actor_df = pd.read_json(io.StringIO(env_actors_json), orient="records")
 
     n_assets = len(asset_df)
 
-    # Build attack graph: nodes = assets, edges weighted by difficulty
-    G = nx.DiGraph()
-    for idx, row in asset_df.iterrows():
-        G.add_node(idx, **row.to_dict())
-    # Create edges (attack paths between adjacent assets)
-    for i in range(n_assets):
-        n_targets = min(n_assets - 1, max(1, int(rng.poisson(3))))
-        targets   = rng.choice([j for j in range(n_assets) if j != i],
-                                size=min(n_targets, n_assets-1), replace=False)
-        for j in targets:
-            vec    = rng.choice(selected_vectors)
-            diff   = ATTACK_VECTORS[vec]["difficulty"]
-            cvss_e = ATTACK_VECTORS[vec]["cvss_base"]
-            G.add_edge(i, j, vector=vec, difficulty=diff,
-                       weight=1.0 - (cvss_e / 10.0), cvss=cvss_e)
+    # ── Attack graph: the layered topology, annotated with attack-vector edges ──
+    G = nx.node_link_graph(json.loads(topology_json))
+    for u, v in list(G.edges()):
+        vec    = rng.choice(selected_vectors)
+        diff   = ATTACK_VECTORS[vec]["difficulty"]
+        cvss_e = ATTACK_VECTORS[vec]["cvss_base"]
+        G[u][v]["vector"]     = vec
+        G[u][v]["difficulty"] = float(diff)
+        G[u][v]["weight"]     = float(1.0 - (cvss_e / 10.0))
+        G[u][v]["cvss"]       = float(cvss_e)
 
-    # Sample attack paths for scenarios
-    entry_points = asset_df[asset_df["exposure"] > 0.6].index.tolist()
+    # Sample attack paths for scenarios — entry points are exposed assets,
+    # high-value targets are the top-criticality nodes (typically in Core).
+    entry_points = asset_df[asset_df["exposure"] > 0.6]["asset_id"].tolist()
     if not entry_points:
-        entry_points = list(range(min(5, n_assets)))
-    high_value = asset_df.nlargest(max(3, n_assets//5), "asset_criticality_score").index.tolist()
+        entry_points = asset_df["asset_id"].head(min(5, n_assets)).tolist()
+    high_value = (
+        asset_df.nlargest(max(3, n_assets // 5), "asset_criticality_score")["asset_id"].tolist()
+    )
 
     rows = []
     for _ in range(n_scenarios):
@@ -302,9 +499,9 @@ def generate_scenarios(env_assets_json, env_actors_json, n_scenarios,
         attack_complexity = float(rng.uniform(0.2, 1.0))
         impact_score    = float((cvss / 10.0) * asset_row["asset_criticality_score"])
 
-        # Shortest path length in attack graph
-        src = int(rng.choice(entry_points))
-        tgt = int(rng.choice(high_value))
+        # Shortest path length in attack graph (asset_id-keyed)
+        src = str(rng.choice(entry_points))
+        tgt = str(rng.choice(high_value))
         try:
             path_len = nx.shortest_path_length(G, source=src, target=tgt, weight="weight")
         except (nx.NetworkXNoPath, nx.NodeNotFound):
@@ -488,6 +685,221 @@ def train_models(features_json, rf_params, gb_params, test_size, cv_folds):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
+# STEP 5b ENGINE — Monte-Carlo Attack Simulation + Alerting Classifier
+#                  (NEW — Home.py ideas #3 + #4)
+# ═══════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def monte_carlo_attack_simulation(env_assets_json, topology_json,
+                                   n_simulations, attack_steps,
+                                   epsilon, seed, normal_alert_rate=0.05):
+    """Run K independent ε-greedy attacker simulations on the layered topology.
+
+    Produces:
+      • An event-level dataset with one row per (sim, step, asset) for both
+        attack events (assets traversed by the attacker) and normal events
+        (random benign asset accesses, matched 1:1 by count per simulation).
+      • A path-statistics dict (mean / std / p95 length, core compromise rate).
+      • The list of attack paths.
+
+    Class label design — IMPORTANT for thesis defence:
+      `alert = 1` for attack events is derived from whether the asset was
+      actually traversed by the attacker, NOT from the regression risk_score.
+      This avoids the target-leakage issue present in many synthetic security
+      datasets where both heads of a dual-task model end up learning the same
+      formula.
+    """
+    rng = np.random.default_rng(seed)
+    asset_df = pd.read_json(io.StringIO(env_assets_json), orient="records")
+    G = nx.node_link_graph(json.loads(topology_json))
+
+    # Indexable lookup for fast per-step feature emission
+    asset_lookup = asset_df.set_index("asset_id").to_dict("index")
+    max_vuln     = max(int(asset_df["vuln_count"].max()), 1)
+
+    def node_score(node_id):
+        """ε-greedy attacker's attractiveness function over neighbour candidates."""
+        a = asset_lookup.get(node_id, {})
+        return (
+            0.30 * a.get("vuln_count", 0) / max_vuln +
+            0.25 * (1.0 - a.get("patch_compliance", 0.5)) +
+            0.20 * a.get("exposure", 0.5) +
+            0.15 * a.get("criticality", 0.5) +
+            0.10 * a.get("betweenness_centrality", 0.0)
+        )
+
+    # Entry pool: highest-exposure assets (typically Access layer)
+    entry_pool = (
+        asset_df.nlargest(max(3, len(asset_df) // 10), "exposure")["asset_id"].tolist()
+    )
+    if not entry_pool:
+        entry_pool = asset_df["asset_id"].head(min(5, len(asset_df))).tolist()
+
+    attack_paths = []
+    events       = []
+    base_time    = datetime(2026, 1, 1, 0, 0, 0)
+
+    NODE_FIELDS = [
+        "asset_type", "layer", "zone",
+        "criticality", "exposure", "patch_compliance", "control_coverage",
+        "vuln_count",  "asset_criticality_score",
+        "degree_centrality", "betweenness_centrality",
+        "eigenvector_centrality", "clustering_coefficient",
+        "layer_ord",
+    ]
+
+    def emit(sim_id, step_idx, asset_id, label, alert_val, ts_offset):
+        a = asset_lookup.get(asset_id, {})
+        row = {"simulation": sim_id, "step": step_idx, "asset_id": asset_id,
+               "label": label, "alert": int(alert_val),
+               "timestamp": (base_time + timedelta(seconds=ts_offset)).isoformat()}
+        for fld in NODE_FIELDS:
+            row[fld] = a.get(fld, 0 if fld not in ("asset_type","layer","zone") else "Unknown")
+        return row
+
+    for sim in range(n_simulations):
+        start = str(rng.choice(entry_pool))
+        path = [start]
+        visited = {start}
+
+        for step in range(attack_steps):
+            # Successors first (attack-flow direction); fall back to predecessors if stuck
+            cands = [n for n in G.successors(path[-1]) if n not in visited]
+            if not cands:
+                cands = [n for n in G.predecessors(path[-1]) if n not in visited]
+            if not cands:
+                break
+            if rng.random() < epsilon:
+                nxt = str(rng.choice(cands))
+            else:
+                nxt = max(cands, key=node_score)
+            path.append(nxt)
+            visited.add(nxt)
+
+        attack_paths.append(path)
+
+        # Attack events
+        for s_idx, aid in enumerate(path):
+            events.append(emit(sim, s_idx, aid, "attack", 1,
+                               sim * 1000 + s_idx * 5))
+
+        # Matched normal events (count = len(path); low false-alarm rate on normals)
+        n_normal = len(path)
+        normal_ids = rng.choice(asset_df["asset_id"].tolist(),
+                                size=min(n_normal, len(asset_df)),
+                                replace=False)
+        for nid in normal_ids:
+            alert_val = 1 if rng.random() < normal_alert_rate else 0
+            events.append(emit(sim, 0, str(nid), "normal", alert_val,
+                               sim * 1000 + 500))
+
+    events_df = pd.DataFrame(events)
+
+    path_lengths = [len(p) for p in attack_paths]
+    compromised  = set().union(*[set(p) for p in attack_paths]) if attack_paths else set()
+    core_breaches = [
+        any(asset_lookup.get(n, {}).get("layer") == "Core" for n in p)
+        for p in attack_paths
+    ]
+
+    stats = {
+        "n_simulations":            len(attack_paths),
+        "mean_path_length":         float(np.mean(path_lengths))   if path_lengths else 0.0,
+        "std_path_length":          float(np.std(path_lengths))    if path_lengths else 0.0,
+        "p95_path_length":          float(np.percentile(path_lengths, 95)) if path_lengths else 0.0,
+        "max_path_length":          int(np.max(path_lengths))      if path_lengths else 0,
+        "unique_assets_compromised":int(len(compromised)),
+        "core_compromise_rate":     float(np.mean(core_breaches))  if core_breaches else 0.0,
+        "epsilon":                  float(epsilon),
+        "attack_event_count":       int(events_df["label"].eq("attack").sum()),
+        "normal_event_count":       int(events_df["label"].eq("normal").sum()),
+    }
+
+    return events_df, attack_paths, stats
+
+
+@st.cache_data(show_spinner=False)
+def train_alert_classifier(events_json, test_size, cv_folds):
+    """Train RF + GB classifiers on the attack-vs-normal event-level dataset.
+
+    Reports operationally-relevant metrics (precision / recall / F1 / ROC-AUC /
+    PR-AUC) and exposes confusion matrices and predicted probabilities for
+    threshold analysis. Uses `class_weight='balanced'` on the RF and stratified
+    splitting to handle the natural class imbalance.
+    """
+    df = pd.read_json(io.StringIO(events_json), orient="records")
+    df["layer_ord"] = df.get("layer_ord", df["layer"].map(LAYER_ORDINAL).fillna(1)).astype(int)
+
+    feats = [f for f in CLASSIFIER_FEATS if f in df.columns]
+    X = df[feats].fillna(0).values
+    y = (df["label"] == "attack").astype(int).values
+
+    if len(np.unique(y)) < 2:
+        return {"error": "Only one class present — cannot train a classifier."}
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=42, stratify=y)
+
+    results = {}
+    candidates = [
+        ("RF Classifier",
+         RandomForestClassifier(n_estimators=150, max_depth=None,
+                                class_weight="balanced",
+                                random_state=42, n_jobs=-1)),
+        ("GB Classifier",
+         GradientBoostingClassifier(n_estimators=100, max_depth=4,
+                                    learning_rate=0.1,
+                                    random_state=42)),
+    ]
+    for name, model in candidates:
+        t0 = time.perf_counter()
+        model.fit(X_train, y_train)
+        train_time = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        y_pred  = model.predict(X_test)
+        infer_ms = (time.perf_counter() - t1) * 1000
+
+        try:
+            y_proba = model.predict_proba(X_test)[:, 1]
+        except Exception:
+            y_proba = y_pred.astype(float)
+
+        # Stratified k-fold CV F1
+        try:
+            cv_f1 = cross_val_score(model, X, y, cv=cv_folds,
+                                    scoring="f1", n_jobs=-1)
+            cv_f1_mean, cv_f1_std = float(cv_f1.mean()), float(cv_f1.std())
+        except Exception:
+            cv_f1_mean, cv_f1_std = float("nan"), float("nan")
+
+        results[name] = {
+            "accuracy":     round(accuracy_score(y_test, y_pred), 4),
+            "precision":    round(precision_score(y_test, y_pred, zero_division=0), 4),
+            "recall":       round(recall_score(y_test, y_pred, zero_division=0), 4),
+            "f1":           round(f1_score(y_test, y_pred, zero_division=0), 4),
+            "roc_auc":      round(roc_auc_score(y_test, y_proba), 4),
+            "pr_auc":       round(average_precision_score(y_test, y_proba), 4),
+            "cv_f1_mean":   round(cv_f1_mean, 4),
+            "cv_f1_std":    round(cv_f1_std,  4),
+            "confusion":    confusion_matrix(y_test, y_pred).tolist(),
+            "y_test":       y_test.tolist(),
+            "y_pred":       y_pred.tolist(),
+            "y_proba":      y_proba.tolist(),
+            "feat_imp":     model.feature_importances_.tolist(),
+            "feat_names":   feats,
+            "train_time_s": round(train_time, 4),
+            "infer_ms":     round(infer_ms, 3),
+            "n_train":      int(len(X_train)),
+            "n_test":       int(len(X_test)),
+            "class_balance":{"attack": int(np.sum(y_train==1)),
+                             "normal": int(np.sum(y_train==0))},
+        }
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 6 ENGINE — Scalability Benchmarking
 # ═══════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,9 +924,10 @@ def run_scalability_benchmark(n_sizes, base_asset_mix_json, base_threat_actors,
         n_sc = max(100, n * 2)
         assets_json = env["assets"].to_json(orient="records")
         actors_json = env["actors"].to_json(orient="records")
+        topology_json = env["topology_json"]
         tracemalloc.start(); t0 = time.perf_counter()
-        sc_df, _ = generate_scenarios(assets_json, actors_json, n_sc,
-                                       base_vectors, seed, max_path_len=8)
+        sc_df, _ = generate_scenarios(assets_json, actors_json, topology_json,
+                                       n_sc, base_vectors, seed, max_path_len=8)
         row["scen_time"]  = round(time.perf_counter() - t0, 5)
         _, row["scen_mem"] = tracemalloc.get_traced_memory(); tracemalloc.stop()
         row["scen_mem"] = round(row["scen_mem"] / 1024, 1)
@@ -600,6 +1013,15 @@ with st.sidebar:
     gb_depth  = st.slider("max_depth (GB)", 2, 8, 4)
 
     st.divider()
+    st.markdown("### 🚨 Step 5b — Alerting (Monte Carlo)")
+    st.caption("Stochastic attacker simulation + binary classifier (attack vs normal).")
+    mc_n_sims     = st.slider("Monte-Carlo simulations", 10, 500, 100, 10)
+    mc_steps      = st.slider("Max attack steps per sim", 4, 40, 12)
+    mc_epsilon    = st.slider("ε (exploration prob.)", 0.0, 0.6, 0.25, 0.05,
+                              help="0 = pure greedy attacker, higher = more stochastic exploration")
+    mc_norm_alert = st.slider("Normal-traffic false-alarm rate", 0.0, 0.20, 0.05, 0.01)
+
+    st.divider()
     st.markdown("### ⚡ Step 6 — Benchmarks")
     bench_max = st.number_input("Max N for benchmark", value=500, step=50,
                                  min_value=50, max_value=2000)
@@ -659,7 +1081,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 (tab_overview,
  tab_step1, tab_step2, tab_step3,
- tab_step4, tab_step5, tab_step6,
+ tab_step4, tab_step5, tab_step5b, tab_step6,
  tab_export) = st.tabs([
     "🏠 Overview",
     "📐 Step 1 · Framework",
@@ -667,6 +1089,7 @@ st.divider()
     "🎲 Step 3 · Scenarios",
     "🔧 Step 4 · Features",
     "🤖 Step 5 · ML Models",
+    "🚨 Step 5b · Alerting",
     "⚡ Step 6 · Scalability",
     "📤 Export",
 ])
@@ -1044,6 +1467,96 @@ with tab_step2:
             st.plotly_chart(fig_actors, use_container_width=True)
             st.dataframe(actor_df, use_container_width=True, hide_index=True)
 
+        # ── NEW: Layered Network Topology (BA + WS + Tree) ──────────────────
+        st.markdown("#### 🧱 Layered Enterprise Topology (Core / Distribution / Access)")
+        st.markdown(
+            "<div class='callout-info'>The enterprise graph is composed of three "
+            "layers built from different random-graph models that match each layer's "
+            "empirical character: <b>Core</b> = Barabási–Albert (scale-free hubs), "
+            "<b>Distribution</b> = Watts–Strogatz (small-world), <b>Access</b> = "
+            "random tree. Inter-layer wiring runs Access → Distribution → Core "
+            "(attack-flow direction).</div>",
+            unsafe_allow_html=True)
+
+        G_topo = nx.node_link_graph(json.loads(env["topology_json"]))
+        # Layout: spring on the undirected view for visual clarity
+        pos = nx.spring_layout(G_topo.to_undirected(), seed=42, k=0.9, iterations=80)
+
+        edge_x, edge_y = [], []
+        for u, v in G_topo.edges():
+            x0, y0 = pos[u]; x1, y1 = pos[v]
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
+        edge_trace = go.Scatter(x=edge_x, y=edge_y, mode="lines",
+                                line=dict(color="#cccccc", width=0.7),
+                                hoverinfo="none", showlegend=False)
+
+        node_traces = [edge_trace]
+        for layer_name, color in LAYER_COLORS.items():
+            xs, ys, labels = [], [], []
+            for n, d in G_topo.nodes(data=True):
+                if d.get("layer") == layer_name:
+                    xs.append(pos[n][0]); ys.append(pos[n][1]); labels.append(n)
+            if xs:
+                node_traces.append(go.Scatter(
+                    x=xs, y=ys, mode="markers", name=f"{layer_name} ({len(xs)})",
+                    marker=dict(size=11, color=color,
+                                line=dict(color="white", width=1.2)),
+                    text=labels,
+                    hovertemplate="<b>%{text}</b><br>Layer: " + layer_name +
+                                  "<extra></extra>",
+                ))
+
+        fig_topo = go.Figure(node_traces)
+        fig_topo.update_layout(
+            title="Layered Network Topology — node size & colour by layer",
+            showlegend=True, height=520,
+            margin=dict(l=0, r=0, t=50, b=0),
+            xaxis=dict(visible=False), yaxis=dict(visible=False),
+            plot_bgcolor="#0f1923", paper_bgcolor="white",
+            legend=dict(orientation="h", y=-0.05))
+        st.plotly_chart(fig_topo, use_container_width=True)
+
+        # Centrality distributions per layer
+        st.markdown("##### 📊 Graph-Structural (Centrality) Features by Layer")
+        st.caption("These features complement the asset-intrinsic features and "
+                   "are fed into the Step 5b alerting classifier.")
+        gc1, gc2 = st.columns(2)
+        with gc1:
+            fig_dc = px.box(asset_df, x="layer", y="degree_centrality",
+                            color="layer", color_discrete_map=LAYER_COLORS,
+                            category_orders={"layer": ["Access", "Distribution", "Core"]},
+                            title="Degree Centrality by Layer")
+            fig_dc.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0),
+                                  showlegend=False)
+            st.plotly_chart(fig_dc, use_container_width=True)
+        with gc2:
+            fig_bc = px.box(asset_df, x="layer", y="betweenness_centrality",
+                            color="layer", color_discrete_map=LAYER_COLORS,
+                            category_orders={"layer": ["Access", "Distribution", "Core"]},
+                            title="Betweenness Centrality by Layer")
+            fig_bc.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0),
+                                  showlegend=False)
+            st.plotly_chart(fig_bc, use_container_width=True)
+
+        gc3, gc4 = st.columns(2)
+        with gc3:
+            fig_ec = px.box(asset_df, x="layer", y="eigenvector_centrality",
+                            color="layer", color_discrete_map=LAYER_COLORS,
+                            category_orders={"layer": ["Access", "Distribution", "Core"]},
+                            title="Eigenvector Centrality by Layer")
+            fig_ec.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0),
+                                  showlegend=False)
+            st.plotly_chart(fig_ec, use_container_width=True)
+        with gc4:
+            fig_cl = px.box(asset_df, x="layer", y="clustering_coefficient",
+                            color="layer", color_discrete_map=LAYER_COLORS,
+                            category_orders={"layer": ["Access", "Distribution", "Core"]},
+                            title="Clustering Coefficient by Layer")
+            fig_cl.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0),
+                                  showlegend=False)
+            st.plotly_chart(fig_cl, use_container_width=True)
+
         # Asset data preview
         st.markdown("#### 📋 Asset Inventory (first 25 rows)")
         st.dataframe(asset_df.head(25), use_container_width=True)
@@ -1073,9 +1586,11 @@ with tab_step3:
                 sc_df, g_data = generate_scenarios(
                     env["assets"].to_json(orient="records"),
                     env["actors"].to_json(orient="records"),
+                    env["topology_json"],
                     n_scenarios, tuple(selected_vecs), rng_seed, max_path_len)
                 st.session_state["scenarios"] = sc_df
                 st.session_state["attack_graph"] = g_data
+                st.session_state["topology"] = env["topology_json"]
 
         if st.session_state["scenarios"] is None:
             st.info("👆 Click **Generate Threat Scenarios** to proceed.")
@@ -1458,6 +1973,254 @@ with tab_step5:
             st.plotly_chart(fig_shcomp, use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TAB: STEP 5b — Monte-Carlo Alerting Classifier  (NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_step5b:
+    st.subheader("🚨 Step 5b: Monte-Carlo Alerting Classifier")
+    st.markdown(
+        "<div class='callout-info'>Runs a stochastic <b>ε-greedy attacker</b> "
+        "across the layered enterprise topology K times, producing a labelled "
+        "event-level dataset (attack vs normal). A binary classifier is then "
+        "trained on graph-structural + asset-intrinsic features to predict "
+        "<b>alert/no-alert</b> — the operationally relevant task in security "
+        "monitoring. Unlike Step 5 (regression), the label here is grounded in "
+        "<b>actual simulated compromise</b>, not the formula-derived risk score, "
+        "so the two heads are genuinely complementary.</div>",
+        unsafe_allow_html=True)
+
+    env_ready = st.session_state["env"] is not None
+    if not env_ready:
+        st.warning("⚠️ Please run **Step 2 — Environment Simulation** first.")
+    else:
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            if st.button("▶ Run Monte-Carlo Attack Simulation", type="primary",
+                         key="run_mc"):
+                env = st.session_state["env"]
+                with st.spinner(f"Running {mc_n_sims} ε-greedy attack simulations…"):
+                    ev_df, paths, stats = monte_carlo_attack_simulation(
+                        env["assets"].to_json(orient="records"),
+                        env["topology_json"],
+                        int(mc_n_sims), int(mc_steps),
+                        float(mc_epsilon), int(rng_seed),
+                        float(mc_norm_alert))
+                    st.session_state["mc_events"] = ev_df
+                    st.session_state["mc_paths"]  = paths
+                    st.session_state["mc_stats"]  = stats
+        with bc2:
+            mc_ready = st.session_state["mc_events"] is not None
+            train_btn_disabled = not mc_ready
+            if st.button("▶ Train Alerting Classifier", type="primary",
+                         key="run_clf", disabled=train_btn_disabled):
+                with st.spinner("Training Random Forest + Gradient Boosting "
+                                "classifiers + 5-fold CV…"):
+                    clf_res = train_alert_classifier(
+                        st.session_state["mc_events"].to_json(orient="records"),
+                        test_size, cv_folds)
+                    st.session_state["clf_results"] = clf_res
+
+        if st.session_state["mc_events"] is None:
+            st.info("👆 Step 1 of 2: Click **Run Monte-Carlo Attack Simulation**.")
+        else:
+            ev_df = st.session_state["mc_events"]
+            stats = st.session_state["mc_stats"]
+            paths = st.session_state["mc_paths"]
+
+            # KPIs from Monte-Carlo simulation
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Simulations",         stats["n_simulations"])
+            m2.metric("Mean Path Length",    f"{stats['mean_path_length']:.2f}")
+            m3.metric("Std Path Length",     f"{stats['std_path_length']:.2f}")
+            m4.metric("Unique Compromised",  stats["unique_assets_compromised"])
+            m5.metric("Core Breach Rate",    f"{stats['core_compromise_rate']*100:.1f}%")
+
+            # Path-length distribution + per-layer compromise rate
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                pl = [len(p) for p in paths]
+                fig_pl = px.histogram(x=pl, nbins=max(5, min(30, len(set(pl)))),
+                                       color_discrete_sequence=["#8e44ad"],
+                                       title="Attack-Path Length Distribution "
+                                             f"(N={len(paths)} sims)")
+                fig_pl.add_vline(x=stats["mean_path_length"], line_dash="dash",
+                                 annotation_text=f"mean={stats['mean_path_length']:.2f}",
+                                 annotation_position="top right")
+                fig_pl.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0),
+                                      xaxis_title="Path length (hops)",
+                                      yaxis_title="Frequency")
+                st.plotly_chart(fig_pl, use_container_width=True)
+            with pc2:
+                # Compromise rate per layer
+                compromised_set = set().union(*[set(p) for p in paths]) if paths else set()
+                env = st.session_state["env"]
+                layer_counts = (
+                    env["assets"][["asset_id", "layer"]]
+                    .assign(compromised=lambda d: d["asset_id"].isin(compromised_set))
+                    .groupby("layer")["compromised"].agg(["sum", "count"])
+                    .reset_index()
+                )
+                layer_counts["rate_%"] = (layer_counts["sum"] / layer_counts["count"]) * 100
+                layer_counts = layer_counts.sort_values(
+                    "layer", key=lambda x: x.map({"Access":0,"Distribution":1,"Core":2}))
+                fig_lc = px.bar(layer_counts, x="layer", y="rate_%",
+                                color="layer", color_discrete_map=LAYER_COLORS,
+                                title="Asset Compromise Rate by Layer")
+                fig_lc.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0),
+                                      showlegend=False,
+                                      yaxis_title="% of layer compromised",
+                                      xaxis_title="Layer")
+                st.plotly_chart(fig_lc, use_container_width=True)
+
+            # Class balance + event preview
+            cb1, cb2 = st.columns([1, 2])
+            with cb1:
+                lbl_counts = ev_df["label"].value_counts().reset_index()
+                lbl_counts.columns = ["Label", "Count"]
+                fig_lb = px.pie(lbl_counts, names="Label", values="Count",
+                                hole=0.45,
+                                color="Label",
+                                color_discrete_map={"attack":"#c0392b",
+                                                     "normal":"#27ae60"},
+                                title="Event Class Balance")
+                fig_lb.update_layout(height=280, margin=dict(l=0, r=0, t=40, b=0))
+                st.plotly_chart(fig_lb, use_container_width=True)
+            with cb2:
+                st.markdown("##### 📋 Event-Level Dataset (first 20 rows)")
+                st.dataframe(ev_df[["simulation","step","asset_id","layer",
+                                     "asset_type","label","alert",
+                                     "criticality","exposure",
+                                     "betweenness_centrality"]].head(20),
+                             use_container_width=True)
+
+            st.download_button("📥 Download Event Dataset (CSV)",
+                               ev_df.to_csv(index=False).encode(),
+                               "mc_event_dataset.csv", "text/csv")
+
+            # ── Classifier results ─────────────────────────────────────────
+            if st.session_state["clf_results"] is None:
+                st.info("👆 Step 2 of 2: Click **Train Alerting Classifier**.")
+            else:
+                clf_res = st.session_state["clf_results"]
+                if "error" in clf_res:
+                    st.error(clf_res["error"])
+                else:
+                    st.markdown("#### 📊 Classifier Comparison — Operational Metrics")
+                    rows = []
+                    for name, r in clf_res.items():
+                        rows.append({
+                            "Model":      name,
+                            "Accuracy":   r["accuracy"],
+                            "Precision":  r["precision"],
+                            "Recall":     r["recall"],
+                            "F1":         r["f1"],
+                            "ROC-AUC":    r["roc_auc"],
+                            "PR-AUC":     r["pr_auc"],
+                            f"CV F1 ({cv_folds}-fold)":
+                                f"{r['cv_f1_mean']:.4f} ± {r['cv_f1_std']:.4f}",
+                            "Train (s)":  r["train_time_s"],
+                            "Infer (ms)": r["infer_ms"],
+                            "n_train":    r["n_train"],
+                            "n_test":     r["n_test"],
+                        })
+                    st.dataframe(pd.DataFrame(rows).set_index("Model"),
+                                 use_container_width=True)
+
+                    # Best-model badge
+                    best_f1 = max(r["f1"] for r in clf_res.values())
+                    if   best_f1 >= 0.90: badge = "🟢 Excellent (F1 ≥ 0.90)"
+                    elif best_f1 >= 0.80: badge = "🟡 Good (F1 ≥ 0.80)"
+                    else:                  badge = "🔴 Needs tuning (F1 < 0.80)"
+                    st.markdown(
+                        f"<div class='callout-good'>Best F1: <b>{best_f1:.4f}</b> — "
+                        f"{badge}</div>", unsafe_allow_html=True)
+
+                    # Per-model diagnostics
+                    sub_tabs = st.tabs(list(clf_res.keys()))
+                    for tab_c, (name, r) in zip(sub_tabs, clf_res.items()):
+                        with tab_c:
+                            d1, d2 = st.columns(2)
+                            with d1:
+                                # Confusion matrix
+                                cm = np.array(r["confusion"])
+                                fig_cm = px.imshow(
+                                    cm, text_auto=True, aspect="equal",
+                                    x=["Pred Normal","Pred Attack"],
+                                    y=["True Normal","True Attack"],
+                                    color_continuous_scale="Blues",
+                                    title=f"{name}: Confusion Matrix")
+                                fig_cm.update_layout(height=320,
+                                    margin=dict(l=0,r=0,t=40,b=0))
+                                st.plotly_chart(fig_cm, use_container_width=True)
+                            with d2:
+                                # ROC curve
+                                y_t  = np.array(r["y_test"])
+                                y_pp = np.array(r["y_proba"])
+                                try:
+                                    fpr, tpr, _ = roc_curve(y_t, y_pp)
+                                except Exception:
+                                    fpr, tpr = np.array([0,1]), np.array([0,1])
+                                fig_roc = go.Figure()
+                                fig_roc.add_trace(go.Scatter(
+                                    x=fpr, y=tpr, mode="lines",
+                                    name=f"ROC (AUC={r['roc_auc']:.3f})",
+                                    line=dict(color="#2980b9", width=2)))
+                                fig_roc.add_trace(go.Scatter(
+                                    x=[0,1], y=[0,1], mode="lines",
+                                    name="Random",
+                                    line=dict(color="grey", dash="dash")))
+                                fig_roc.update_layout(
+                                    title=f"{name}: ROC Curve",
+                                    xaxis_title="False Positive Rate",
+                                    yaxis_title="True Positive Rate",
+                                    height=320, margin=dict(l=0,r=0,t=40,b=0),
+                                    legend=dict(y=0.05, x=0.55))
+                                st.plotly_chart(fig_roc, use_container_width=True)
+
+                            # PR curve + Feature importance
+                            d3, d4 = st.columns(2)
+                            with d3:
+                                try:
+                                    prec, rec, _ = precision_recall_curve(y_t, y_pp)
+                                except Exception:
+                                    prec, rec = np.array([0,1]), np.array([1,0])
+                                fig_pr = go.Figure()
+                                fig_pr.add_trace(go.Scatter(
+                                    x=rec, y=prec, mode="lines",
+                                    name=f"PR (AP={r['pr_auc']:.3f})",
+                                    line=dict(color="#c0392b", width=2)))
+                                fig_pr.update_layout(
+                                    title=f"{name}: Precision–Recall",
+                                    xaxis_title="Recall",
+                                    yaxis_title="Precision",
+                                    height=320, margin=dict(l=0,r=0,t=40,b=0),
+                                    legend=dict(y=0.05, x=0.55))
+                                st.plotly_chart(fig_pr, use_container_width=True)
+                            with d4:
+                                imp = np.array(r["feat_imp"])
+                                fn  = r["feat_names"]
+                                order = np.argsort(imp)
+                                fig_fi = go.Figure(go.Bar(
+                                    y=[fn[i] for i in order],
+                                    x=imp[order], orientation="h",
+                                    marker_color="#8e44ad"))
+                                fig_fi.update_layout(
+                                    title=f"{name}: Feature Importance",
+                                    xaxis_title="Importance",
+                                    height=320, margin=dict(l=0,r=0,t=40,b=0))
+                                st.plotly_chart(fig_fi, use_container_width=True)
+
+                    st.markdown(
+                        "<div class='callout-warn'>"
+                        "<b>Methodological note for thesis defence:</b> "
+                        "The alerting label is derived from <i>actual simulated "
+                        "compromise</i> by the ε-greedy attacker, not from the "
+                        "regression target (risk_score). This means Steps 5 and "
+                        "5b are genuinely complementary tasks rather than two "
+                        "views of the same formula — a common subtle leakage "
+                        "issue in synthetic security datasets.</div>",
+                        unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TAB: STEP 6 — Scalability Evaluation
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_step6:
@@ -1669,6 +2432,11 @@ with tab_export:
                 st.session_state["features"].to_csv(index=False).encode(),
                 "engineered_features.csv", "text/csv")
 
+        if st.session_state["mc_events"] is not None:
+            st.download_button("📥 Monte-Carlo Event Dataset (CSV)",
+                st.session_state["mc_events"].to_csv(index=False).encode(),
+                "mc_event_dataset.csv", "text/csv")
+
     with col_b:
         st.markdown("#### 📊 Results Artifacts")
         if st.session_state["ml_results"] is not None:
@@ -1692,6 +2460,23 @@ with tab_export:
                 st.session_state["bench_results"].to_csv(index=False).encode(),
                 "scalability_benchmark.csv", "text/csv")
 
+        if st.session_state["clf_results"] is not None and "error" not in st.session_state["clf_results"]:
+            clf_res = st.session_state["clf_results"]
+            clf_rows = []
+            for name, r in clf_res.items():
+                clf_rows.append({
+                    "Model":     name,
+                    "accuracy":  r["accuracy"], "precision": r["precision"],
+                    "recall":    r["recall"],   "f1":        r["f1"],
+                    "roc_auc":   r["roc_auc"],  "pr_auc":    r["pr_auc"],
+                    "cv_f1_mean":r["cv_f1_mean"], "cv_f1_std": r["cv_f1_std"],
+                    "train_time_s": r["train_time_s"], "infer_ms": r["infer_ms"],
+                    "n_train": r["n_train"], "n_test": r["n_test"],
+                })
+            st.download_button("📥 Alerting Classifier Metrics (CSV)",
+                pd.DataFrame(clf_rows).to_csv(index=False).encode(),
+                "alerting_classifier_metrics.csv", "text/csv")
+
         # Full config JSON
         config = {
             "n_assets": n_assets, "seed": rng_seed,
@@ -1700,6 +2485,11 @@ with tab_export:
             "max_path_len": max_path_len, "test_size": test_size,
             "cv_folds": cv_folds, "rf_params": rf_params, "gb_params": gb_params,
             "bench_sizes": list(bench_sizes),
+            # NEW — Step 5b parameters
+            "mc_n_sims":     mc_n_sims,
+            "mc_steps":      mc_steps,
+            "mc_epsilon":    mc_epsilon,
+            "mc_norm_alert": mc_norm_alert,
         }
         st.download_button("🧾 Full Experiment Config (JSON)",
             json.dumps(config, indent=2).encode(), "experiment_config.json", "application/json")
